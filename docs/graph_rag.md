@@ -283,8 +283,8 @@ The ingestion module applies patches to three FalkorDB/Graphiti functions to pre
 
 ### Neo4jIngestionEnhanced
 
-**File:** `coded_tools/graph_rag/neo4j_injestion.py`
-**Class:** `graph_rag.neo4j_injestion.Neo4jIngestionEnhanced`
+**File:** `coded_tools/graph_rag/neo4j_ingestion.py`
+**Class:** `graph_rag.neo4j_ingestion.Neo4jIngestionEnhanced`
 **Extends:** `CodedTool` (neuro-san)
 
 Functionally identical to `FalkorDBIngestionEnhanced` but targets Neo4j instead of FalkorDB. Uses the same document parsing, episode structure, and metadata extraction. Does not require the FalkorDB-specific monkey patches.
@@ -433,7 +433,7 @@ coded_tools/graph_rag/
     __init__.py                  # Package init, exports GraphSearchTool
     graph_search_tool.py         # Main search tool (~2050 lines)
     falkordb_ingestion.py        # FalkorDB ingestion tool (~1790 lines)
-    neo4j_injestion.py           # Neo4j ingestion tool (~1645 lines)
+    neo4j_ingestion.py           # Neo4j ingestion tool (~1645 lines)
     constrained_prompts.py       # Anti-hallucination prompts for Graphiti (~394 lines)
     .env                         # Environment configuration (not committed)
     .ingestion_checkpoint.txt    # Ingestion resume checkpoint (auto-generated)
