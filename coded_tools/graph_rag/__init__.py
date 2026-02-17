@@ -13,6 +13,5 @@ Graph RAG coded tools.
 """
 
 from .graph_search_tool import GraphSearchTool
-from .postgres_search_tool import PostgresSearchTool
 
-__all__ = ["PostgresSearchTool", "GraphSearchTool"]
+__all__ = ["GraphSearchTool"]

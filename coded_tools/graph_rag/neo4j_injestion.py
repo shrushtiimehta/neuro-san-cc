@@ -10,10 +10,10 @@
 # END COPYRIGHT
 # pylint: disable=too-many-lines,wrong-import-position
 """
-UNFCCC Climate Document Ingestion for FalkorDB Knowledge Graph.
+UNFCCC Climate Document Ingestion for Neo4j Knowledge Graph.
 
 This module ingests United Nations Framework Convention on Climate Change (UNFCCC)
-documents into a FalkorDB-backed knowledge graph using the Graphiti framework.
+documents into a Neo4j-backed knowledge graph using the Graphiti framework.
 
 Key Features:
     - Parses UNFCCC COP, CMA, CMP, SBI, and SBSTA decision documents
@@ -64,185 +64,13 @@ from dotenv import load_dotenv
 _current_dir = Path(__file__).parent
 load_dotenv(dotenv_path=_current_dir / ".env")
 
-# Monkey patch FalkorDB search functions to prevent query timeout issues.
-import graphiti_core.search.search_filters as search_filters_module
-import graphiti_core.search.search_utils as search_utils_module
 from graphiti_core import Graphiti
-from graphiti_core.driver.driver import GraphDriver
-from graphiti_core.driver.driver import GraphProvider
-from graphiti_core.driver.falkordb_driver import FalkorDriver
-from graphiti_core.edges import EntityEdge
 from graphiti_core.nodes import EpisodeType
 from graphiti_core.search.search_config_recipes import NODE_HYBRID_SEARCH_RRF
 
-_original_edge_search_filter = (
-    search_filters_module.edge_search_filter_query_constructor
-)
-_original_edge_fulltext_search = search_utils_module.edge_fulltext_search
 
-
-def patched_edge_search_filter_query_constructor(
-    filters, provider: GraphProvider
-) -> tuple[list[str], dict[str, Any]]:
-    """Prevents FalkorDB query timeouts by normalizing empty edge UUID lists.
-
-    Converts empty edge_uuids lists to None to avoid inefficient query patterns
-    that cause timeouts in FalkorDB when filtering with empty collections.
-
-    Args:
-        filters: Search filter object potentially containing edge_uuids list.
-        provider: Graph database provider instance.
-
-    Returns:
-        Tuple of query parts and parameters for edge search filtering.
-    """
-    if (
-        hasattr(filters, "edge_uuids")
-        and filters.edge_uuids is not None
-        and len(filters.edge_uuids) == 0
-    ):
-        filters.edge_uuids = None
-    return _original_edge_search_filter(filters, provider)
-
-
-async def patched_edge_fulltext_search(
-    driver: GraphDriver,
-    query: str,
-    search_filter,
-    group_ids: list[str] | None = None,
-    limit: int = 10,
-) -> list[EntityEdge]:
-    """Optimizes edge search performance by using direct lookups instead of full-text search.
-
-    For large knowledge graphs, full-text search becomes prohibitively slow. This
-    patched version uses direct UUID-based lookups when edge_uuids are provided,
-    falling back to empty results for unrestricted searches to maintain performance.
-
-    Args:
-        driver: Graph database driver instance.
-        query: Search query string (used only in fallback).
-        search_filter: Filter object with optional edge_uuids constraint.
-        group_ids: Optional list of group IDs to filter results.
-        limit: Maximum number of results to return.
-
-    Returns:
-        List of EntityEdge objects matching the search criteria.
-    """
-
-    # Treat empty edge_uuids list as None
-    if (
-        hasattr(search_filter, "edge_uuids")
-        and search_filter.edge_uuids is not None
-        and len(search_filter.edge_uuids) == 0
-    ):
-        search_filter.edge_uuids = None
-
-    # For large graphs, full-text search is too slow. If no specific edge_uuids
-    # are provided, skip full-text search and rely on vector similarity instead.
-    if not hasattr(search_filter, "edge_uuids") or search_filter.edge_uuids is None:
-        return []
-
-    # For small UUID lists, direct lookup is much faster than full-text search
-    if (
-        hasattr(search_filter, "edge_uuids")
-        and search_filter.edge_uuids is not None
-        and len(search_filter.edge_uuids) > 0
-        and len(search_filter.edge_uuids) <= 20
-    ):
-        match_query = """
-        MATCH (n:Entity)-[e:RELATES_TO]->(m:Entity)
-        WHERE e.uuid IN $edge_uuids
-        """
-        if group_ids is not None:
-            match_query += " AND e.group_id IN $group_ids"
-
-        match_query += """
-        RETURN
-            e.uuid AS uuid,
-            n.uuid AS source_node_uuid,
-            m.uuid AS target_node_uuid,
-            e.group_id AS group_id,
-            e.created_at AS created_at,
-            e.name AS name,
-            e.fact AS fact,
-            e.episodes AS episodes,
-            e.expired_at AS expired_at,
-            e.valid_at AS valid_at,
-            e.invalid_at AS invalid_at,
-            properties(e) AS attributes
-        LIMIT $limit
-        """
-
-        try:
-            records, _, _ = await driver.execute_query(
-                match_query,
-                edge_uuids=search_filter.edge_uuids,
-                group_ids=group_ids if group_ids else [],
-                limit=limit,
-                routing_="r",
-            )
-
-            from graphiti_core.search.search_utils import \
-                get_entity_edge_from_record  # pylint: disable=import-outside-toplevel
-
-            edges = [
-                get_entity_edge_from_record(record, driver.provider)
-                for record in records
-            ]
-            return edges
-        except Exception:  # pylint: disable=broad-exception-caught
-            # Fallback to original full-text search if direct lookup fails
-            pass
-
-    # Fallback to original implementation for other cases
-    return await _original_edge_fulltext_search(
-        driver, query, search_filter, group_ids, limit
-    )
-
-
-search_filters_module.edge_search_filter_query_constructor = (
-    patched_edge_search_filter_query_constructor
-)
-search_utils_module.edge_fulltext_search = patched_edge_fulltext_search
-
-# Patch FalkorDriver.execute_query to sanitize empty edge_uuids at the driver level.
-_original_falkor_execute_query = FalkorDriver.execute_query
-
-
-async def patched_falkor_execute_query(self, cypher_query_, **kwargs):
-    """Sanitizes query parameters to prevent FalkorDB execution errors.
-
-    Removes empty edge_uuids parameters and adjusts Cypher query syntax accordingly
-    to avoid malformed queries that would cause database errors or timeouts.
-
-    Args:
-        self: FalkorDriver instance.
-        cypher_query_: The Cypher query string to execute.
-        **kwargs: Query parameters including potential edge_uuids list.
-
-    Returns:
-        Query execution result from the original FalkorDB driver method.
-    """
-    if (
-        "edge_uuids" in kwargs
-        and isinstance(kwargs["edge_uuids"], list)
-        and len(kwargs["edge_uuids"]) == 0
-    ):
-        kwargs.pop("edge_uuids", None)
-        if "WHERE e.uuid in $edge_uuids" in cypher_query_:
-            cypher_query_ = cypher_query_.replace(
-                " WHERE e.uuid in $edge_uuids AND ", " WHERE "
-            )
-            cypher_query_ = cypher_query_.replace(" AND e.uuid in $edge_uuids", "")
-            cypher_query_ = cypher_query_.replace(" WHERE e.uuid in $edge_uuids", "")
-    return await _original_falkor_execute_query(self, cypher_query_, **kwargs)
-
-
-FalkorDriver.execute_query = patched_falkor_execute_query
-
-
-class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance-attributes
-    """Ingests UNFCCC climate documents into FalkorDB knowledge graph.
+class Neo4jIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance-attributes
+    """Ingests UNFCCC climate documents into Neo4j knowledge graph.
 
     This class processes United Nations Framework Convention on Climate Change (UNFCCC)
     documents, extracting structured information about decisions, resolutions, annexes,
@@ -351,6 +179,17 @@ class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance
         r"(?:\s*/\s*[A-Za-z]+\.\d+)))?"
     )
 
+    # Decision action classification patterns
+    CREATION_VERBS_RE = re.compile(
+        r'(?i)\b(establishes?|creates?|decides\s+to\s+establish|'
+        r'decides\s+to\s+create|launches?|inaugurates?|sets?\s+up)\b'
+    )
+    FOLLOWUP_VERBS_RE = re.compile(
+        r'(?i)\b(further\s+develops?|also\s+recalling|'
+        r'builds?\s+on|welcomes?\s+the\s+continued|reaffirms?|'
+        r'decides\s+that\s+.{5,40}shall\s+have)\b'
+    )
+
     CLIMATE_QUERIES = [
         "What is the Paris Agreement?",
         "What are the decisions on climate finance?",
@@ -368,7 +207,7 @@ class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance
     ]
 
     def __init__(self) -> None:
-        """Initializes the FalkorDB ingestion tool with default configuration.
+        """Initializes the Neo4j ingestion tool with default configuration.
 
         Sets up logging, loads configuration from environment variables, and
         initializes data structures for tracking decisions and references during ingestion.
@@ -400,7 +239,7 @@ class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance
             self.config = self._load_config(args)
         summary = await self.run()
         return (
-            "FalkorDB ingestion completed: "
+            "Neo4j ingestion completed: "
             f"{summary['success']} succeeded, {summary['failed']} failed "
             f"out of {summary['prepared']} prepared episodes. "
             f"{summary['references_extracted']} references extracted and stored in metadata."
@@ -409,7 +248,7 @@ class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance
     async def run(self) -> Dict[str, int]:
         """Executes complete document ingestion pipeline.
 
-        Connects to FalkorDB, processes all documents in the configured data directory,
+        Connects to Neo4j, processes all documents in the configured data directory,
         extracts structured information and references, optionally runs demonstration
         queries, and returns processing statistics.
 
@@ -421,12 +260,11 @@ class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance
                 - references_extracted: Total cross-document references found
         """
         self.logger.info(
-            "Connecting to FalkorDB database at %s:%s",
-            self.config["host"],
-            self.config["port"],
+            "Connecting to Neo4j database at %s",
+            self.config["neo4j_uri"],
         )
         graphiti = self._create_graphiti_client()
-        self.logger.info("Successfully connected to FalkorDB")
+        self.logger.info("Successfully connected to Neo4j")
 
         summary: Dict[str, int] = {
             "prepared": 0,
@@ -554,6 +392,7 @@ class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance
                 if decision_id:
                     enriched_metadata["decision_id"] = decision_id
                     self.decision_registry[decision_id] = episode_name
+                    enriched_metadata["decision_action_type"] = self._classify_decision_action(section["body"])
 
                 if annex_id:
                     enriched_metadata["annex_id"] = annex_id
@@ -803,6 +642,28 @@ class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance
 
         return paragraphs
 
+    def _classify_decision_action(self, text: str) -> str:
+        """Classify whether a decision creates something new or follows up on prior work.
+
+        Analyzes the first 2000 characters of the decision text for creation verbs
+        (establishes, creates, launches) vs follow-up verbs (further develops, recalling,
+        reaffirms) to determine the decision's action type.
+
+        Args:
+            text: Decision text to classify.
+
+        Returns:
+            One of 'founding', 'follow_up', or 'neutral'.
+        """
+        check_text = text[:2000]
+        creation_matches = len(self.CREATION_VERBS_RE.findall(check_text))
+        followup_matches = len(self.FOLLOWUP_VERBS_RE.findall(check_text))
+        if creation_matches > 0 and creation_matches >= followup_matches:
+            return "founding"
+        elif followup_matches > creation_matches:
+            return "follow_up"
+        return "neutral"
+
     def _load_config(
         self, overrides: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
@@ -816,7 +677,7 @@ class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance
 
         Returns:
             Complete configuration dictionary with keys:
-                - host, port, username, password: Database connection settings
+                - neo4j_uri, neo4j_user, neo4j_password: Database connection settings
                 - data_dir: Path to source documents
                 - batch_size, max_episodes, search_limit: Processing parameters
                 - enable_demo_searches, verbose_logging: Feature flags
@@ -825,10 +686,9 @@ class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance
 
         config: Dict[str, Any] = {
             # Connection settings from environment only (no overrides allowed)
-            "host": os.environ.get("FALKORDB_HOST", "localhost"),
-            "port": os.environ.get("FALKORDB_PORT", "6379"),
-            "username": os.environ.get("FALKORDB_USERNAME"),
-            "password": os.environ.get("FALKORDB_PASSWORD"),
+            "neo4j_uri": os.environ.get("NEO4J_URI", "bolt://localhost:7687"),
+            "neo4j_user": os.environ.get("NEO4J_USER", "neo4j"),
+            "neo4j_password": os.environ.get("NEO4J_PASSWORD", "password"),
             # Data source (overrideable)
             "data_dir": Path(os.environ.get("DATA_DIR", "documents")),
             # Processing settings (overrideable)
@@ -879,24 +739,14 @@ class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance
         return bool(value)
 
     def _create_graphiti_client(self) -> Graphiti:  # pylint: disable=too-many-locals
-        """Creates and configures a Graphiti client for FalkorDB.
+        """Creates and configures a Graphiti client for Neo4j.
 
-        Initializes the Graphiti framework with FalkorDB driver and applies
+        Initializes the Graphiti framework with Neo4j driver and applies
         constrained prompts to prevent entity hallucinations during graph construction.
 
         Returns:
             Configured Graphiti client instance ready for use.
         """
-        graph_name = os.getenv("FALKORDB_GRAPH_NAME", "unfccc_knowledge_graph")
-
-        driver = FalkorDriver(
-            host=self.config["host"],
-            port=self.config["port"],
-            username=self.config["username"],
-            password=self.config["password"],
-            database=graph_name,
-        )
-
         # Apply constrained prompts to prevent entity hallucinations
         try:
             try:
@@ -924,7 +774,11 @@ class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance
                 "Continuing with default Graphiti prompts (may cause hallucinations)"
             )
 
-        return Graphiti(graph_driver=driver)
+        return Graphiti(
+            self.config["neo4j_uri"],
+            self.config["neo4j_user"],
+            self.config["neo4j_password"]
+        )
 
     def _collect_documents(self, base_dir: Path) -> List[Path]:
         """Collects all text document files from the specified directory.
@@ -1229,6 +1083,8 @@ class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance
             header_lines.append(f"Location: {metadata['location']}")
         if metadata.get("fccc_reference"):
             header_lines.append(f"Document: {metadata['fccc_reference']}")
+        if metadata.get("decision_action_type"):
+            header_lines.append(f"Decision Type: {metadata['decision_action_type']}")
 
         if not header_lines:
             return section_body
@@ -1779,10 +1635,10 @@ class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance
 async def main() -> None:
     """Standalone entry point for manual execution.
 
-    Creates a FalkorDBIngestionEnhanced instance with default configuration
+    Creates a Neo4jIngestionEnhanced instance with default configuration
     from environment variables and runs the complete ingestion pipeline.
     """
-    runner = FalkorDBIngestionEnhanced()
+    runner = Neo4jIngestionEnhanced()
     await runner.run()
 
 

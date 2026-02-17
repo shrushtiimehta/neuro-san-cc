@@ -335,6 +335,33 @@ Extract ALL relationships:
 - IPCC PROVIDES special reports
 - special reports RELATES_TO 1.5°C goal
 
+## CRITICAL: FOUNDING vs FOLLOW-UP DISTINCTION
+When extracting relationships, distinguish between CREATION and FOLLOW-UP actions:
+
+FOUNDING relationships (use these relation_types):
+- ESTABLISHES: "Establishes the Santiago network", "Decides to establish a committee"
+- CREATES: "Creates a new fund", "Sets up a mechanism"
+- LAUNCHES: "Launches the Koronivia joint work"
+→ Set valid_at to the decision's reference_time (marks creation date)
+
+FOLLOW-UP relationships (use these relation_types):
+- FURTHER_DEVELOPS: "Further develops the institutional arrangements"
+- EXPANDS: "Decides that [X] shall have the following functions"
+- OPERATIONALIZES: "Operationalizes the network by defining its structure"
+- REVIEWS: "Reviews the mechanism and recommends changes"
+→ Reference the original founding decision in the fact text when possible
+
+Example:
+- Text: "Establishes the Santiago network for averting loss and damage"
+  → relation_type: ESTABLISHES (FOUNDING action)
+- Text: "Decides that the Santiago network shall have the following functions"
+  → relation_type: FURTHER_DEVELOPS (FOLLOW-UP action, not creation)
+- Text: "Also recalling decision 2/CMA.2"
+  → relation_type: REFERENCES (points backward to founding decision)
+
+This distinction is CRITICAL for answering questions like
+"Which decision first created X?" vs "Which decision expanded X?"
+
 ## EXTRACTION MANDATE:
 - Extract ALL explicit relationships, not just the primary one
 - If a decision discusses multiple topics, create multiple ADDRESSES / \
