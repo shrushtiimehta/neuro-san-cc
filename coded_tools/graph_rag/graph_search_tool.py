@@ -45,7 +45,6 @@ Search Types:
        Best for getting exact wording from source documents.
 """
 import os
-import re
 import traceback
 from pathlib import Path
 from typing import Any
@@ -63,9 +62,6 @@ load_dotenv(dotenv_path=_current_dir / ".env")
 from graphiti_core import Graphiti
 from graphiti_core.driver.falkordb_driver import FalkorDriver
 from graphiti_core.driver.neo4j_driver import Neo4jDriver
-from graphiti_core.search.search_config_recipes import COMBINED_HYBRID_SEARCH_RRF
-from graphiti_core.search.search_config_recipes import EDGE_HYBRID_SEARCH_RRF
-from graphiti_core.search.search_config_recipes import NODE_HYBRID_SEARCH_RRF
 
 
 class GraphSearchTool(CodedTool):
@@ -83,113 +79,6 @@ class GraphSearchTool(CodedTool):
     _db_type: Optional[str] = None  # Track which database we're using
     # Max output size in characters (~10K tokens) to stay within GPT-4o context
     MAX_OUTPUT_CHARS = 40000
-
-    UNFCCC_CONCEPTS = [
-        "mitigation", "adaptation", "co-benefits", "NDC", "nationally determined contribution",
-        "transparency", "reporting", "review", "compliance", "finance", "technology transfer",
-        "capacity building", "loss and damage", "market mechanism", "Article 6",
-        "global stocktake", "enhanced transparency framework", "ETF", "biennial transparency report",
-        "BTR", "nationally appropriate mitigation action", "NAMA", "adaptation communication",
-        "economic diversification", "just transition", "common timeframes", "IPCC",
-        "developed country", "developing country", "least developed country", "LDC",
-        "small island developing state", "SIDS", "Party", "Parties",
-    ]
-
-    CONFERENCE_TYPES = ["COP", "CMA", "CMP", "SBI", "SBSTA"]
-
-    CONF_CONSTRAINT_PATTERNS = [
-        (r'\bcma\s+(?:decision|session)', "CMA"),
-        (r'\bcop\s+(?:decision|session)', "COP"),
-        (r'\bcp\s+(?:decision|session)', "COP"),
-        (r'\bcmp\s+(?:decision|session)', "CMP"),
-        (r'\bsbi\s+(?:decision|session|report)', "SBI"),
-        (r'\bsbsta\s+(?:decision|session|report)', "SBSTA"),
-        (r'\bacross\s+(?:\w+\s+)?cma\b', "CMA"),
-        (r'\bacross\s+(?:\w+\s+)?cop\b', "COP"),
-        (r'\bacross\s+(?:\w+\s+)?cmp\b', "CMP"),
-        (r'\ba\s+(?:later\s+)?cma\b', "CMA"),
-        (r'\ba\s+(?:later\s+)?cop\b', "COP"),
-        (r'\ba\s+(?:later\s+)?cmp\b', "CMP"),
-        (r'\bwhich\s+cma\b', "CMA"),
-        (r'\bwhich\s+cop\b', "COP"),
-        (r'\bwhich\s+cmp\b', "CMP"),
-    ]
-
-    STRUCTURAL_TERMS = {
-        "annex": r'\bannex(?:es)?\s*[IVX\d]*\b',
-        "decision": r'\bdecision\s*\d+/[A-Z]+\.\d+\b',
-        "article": r'\barticle\s*\d+\b',
-        "paragraph": r'\bparagraph\s*\d+\b',
-        "section": r'\bsection\s*[IVX\d]+\b',
-    }
-
-    CHRONOLOGICAL_EARLIEST_MARKERS = [
-        "first", "originally", "initially", "created", "creates",
-        "established", "establishes", "founded", "founds",
-        "inception", "origin", "earliest", "when was",
-        "who created", "who established", "which decision created",
-        "which decision established", "which decision creates",
-        "set up", "sets up", "launched", "launches",
-    ]
-
-    CHRONOLOGICAL_LATEST_MARKERS = [
-        "latest", "most recent", "current", "last updated", "newest",
-    ]
-
-    TIMELINE_MARKERS = [
-        "all decisions", "every decision", "timeline", "evolution",
-        "history of", "how did", "what decisions were made",
-        "what decisions address", "complete history",
-        "chronolog", "over time", "across sessions", "track",
-        "follow-up", "follow up", "review timing", "review cycle",
-        "reporting cycle", "subsequent", "later sessions",
-        "multiple sessions", "across multiple", "governance",
-    ]
-
-    IDENTIFICATION_MARKERS = [
-        "a decision", "a later decision", "a cma decision", "a cop decision",
-        "a cmp decision", "the decision that", "which decision",
-        "which cma decision", "which cop decision", "which cmp decision",
-        "identify the decision", "find the decision",
-        "a later cma", "a later cop", "a later cmp",
-    ]
-
-    GOVERNANCE_PHASE_MARKERS = [
-        "establishes", "creates", "set up", "sets up",
-        "follow-up", "follow up", "operationalize",
-        "review", "reporting", "integration", "mandate",
-        "recommendations", "workplan", "work plan",
-        "annual report", "midterm review",
-    ]
-
-    COMMON_STOP_WORDS = {
-        "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for",
-        "of", "with", "by", "from", "is", "are", "was", "were", "be", "been",
-        "has", "have", "had", "do", "does", "did", "will", "would", "should",
-        "could", "may", "might", "must", "shall", "can",
-    }
-
-    QUERY_TERM_MAPPINGS = {
-        "mitigation co-benefits": ["co-benefits from mitigation", "mitigation benefits", "ancillary benefits"],
-        "adaptation action": ["adaptation activities", "adaptation measures", "adaptation efforts"],
-        "economic diversification": ["diversification plans", "economic transformation", "structural transformation"],
-        "additional information": ["further information", "supplementary information", "more detailed information"],
-        "Party": ["country", "nation", "State Party", "Parties"],
-        "must provide": ["shall provide", "required to provide", "obligation to provide", "provide"],
-        "transparency": ["transparency framework", "ETF", "enhanced transparency framework"],
-        "reporting": ["report", "BTR", "biennial transparency report", "national communication"],
-        "NDC": ["nationally determined contribution", "nationally determined contributions"],
-        "annex": ["annexes", "appendix", "attachment"],
-        "decision": ["decisions", "decision document"],
-    }
-
-    CONF_ALIASES = {
-        "COP": ["COP", "CP"],
-        "CMA": ["CMA"],
-        "CMP": ["CMP"],
-        "SBI": ["SBI"],
-        "SBSTA": ["SBSTA"],
-    }
 
     async def async_invoke(self, args: Dict[str, Any], sly_data: Dict[str, Any]) -> str:
         """
@@ -353,15 +242,27 @@ class GraphSearchTool(CodedTool):
             analysis["intent"] = "relationship"
 
         # Extract UNFCCC-specific concepts
-        for concept in self.UNFCCC_CONCEPTS:
+        unfccc_concepts = [
+            "mitigation", "adaptation", "co-benefits", "NDC", "nationally determined contribution",
+            "transparency", "reporting", "review", "compliance", "finance", "technology transfer",
+            "capacity building", "loss and damage", "market mechanism", "Article 6",
+            "global stocktake", "enhanced transparency framework", "ETF", "biennial transparency report",
+            "BTR", "nationally appropriate mitigation action", "NAMA", "adaptation communication",
+            "economic diversification", "just transition", "common timeframes", "IPCC",
+            "developed country", "developing country", "least developed country", "LDC",
+            "small island developing state", "SIDS", "Party", "Parties"
+        ]
+        for concept in unfccc_concepts:
             if concept in query_lower:
                 analysis["key_concepts"].append(concept)
 
         # Extract temporal markers
+        import re
         years = re.findall(r'\b(19\d{2}|20\d{2})\b', query)
         analysis["temporal_markers"].extend(years)
 
-        for conf in self.CONFERENCE_TYPES:
+        conference_types = ["COP", "CMA", "CMP", "SBI", "SBSTA"]
+        for conf in conference_types:
             if conf.lower() in query_lower:
                 analysis["temporal_markers"].append(conf)
 
@@ -370,13 +271,30 @@ class GraphSearchTool(CodedTool):
         # Also handle "CP" as alias for "COP"
         conference_filter = None
         # Check for explicit conference constraints (order matters: check longer patterns first)
-        for pattern, conf_type in self.CONF_CONSTRAINT_PATTERNS:
+        conf_constraint_patterns = [
+            (r'\bcma\s+(?:decision|session)', "CMA"),
+            (r'\bcop\s+(?:decision|session)', "COP"),
+            (r'\bcp\s+(?:decision|session)', "COP"),
+            (r'\bcmp\s+(?:decision|session)', "CMP"),
+            (r'\bsbi\s+(?:decision|session|report)', "SBI"),
+            (r'\bsbsta\s+(?:decision|session|report)', "SBSTA"),
+            (r'\bacross\s+(?:\w+\s+)?cma\b', "CMA"),
+            (r'\bacross\s+(?:\w+\s+)?cop\b', "COP"),
+            (r'\bacross\s+(?:\w+\s+)?cmp\b', "CMP"),
+            (r'\ba\s+(?:later\s+)?cma\b', "CMA"),
+            (r'\ba\s+(?:later\s+)?cop\b', "COP"),
+            (r'\ba\s+(?:later\s+)?cmp\b', "CMP"),
+            (r'\bwhich\s+cma\b', "CMA"),
+            (r'\bwhich\s+cop\b', "COP"),
+            (r'\bwhich\s+cmp\b', "CMP"),
+        ]
+        for pattern, conf_type in conf_constraint_patterns:
             if re.search(pattern, query_lower):
                 conference_filter = conf_type
                 break
         # Fallback: if only one conference type is mentioned in the query, use it as filter
         if not conference_filter:
-            mentioned_confs = [c for c in self.CONFERENCE_TYPES if c.lower() in query_lower]
+            mentioned_confs = [c for c in conference_types if c.lower() in query_lower]
             # Also check for "cp" as alias for COP
             if "cp" in query_lower.split() and "COP" not in mentioned_confs:
                 mentioned_confs.append("COP")
@@ -384,8 +302,29 @@ class GraphSearchTool(CodedTool):
                 conference_filter = mentioned_confs[0]
         analysis["conference_filter"] = conference_filter
 
+        # Detect enumeration/listing queries
+        # e.g., "four areas of work", "list the", "what are the three"
+        enumeration_patterns = [
+            r'\b(?:what\s+are\s+the\s+)?(?:four|three|five|six|seven|two|\d+)\s+(?:areas|elements|components|pillars|modalities|principles|objectives|functions|activities|workstreams|themes|topics|categories|types)\b',
+            r'\blist\s+(?:the|all)\b',
+            r'\benumerate\b',
+            r'\bwhat\s+(?:are|were)\s+the\s+(?:main|key|specific|particular)\b',
+            r'\bareas\s+of\s+work\b',
+            r'\bwork\s+programme\b',
+        ]
+        analysis["is_enumeration_query"] = any(
+            re.search(p, query_lower) for p in enumeration_patterns
+        )
+
         # Extract structural markers (document structure references)
-        for term, pattern in self.STRUCTURAL_TERMS.items():
+        structural_terms = {
+            "annex": r'\bannex(?:es)?\s*[IVX\d]*\b',
+            "decision": r'\bdecision\s*\d+/[A-Z]+\.\d+\b',
+            "article": r'\barticle\s*\d+\b',
+            "paragraph": r'\bparagraph\s*\d+\b',
+            "section": r'\bsection\s*[IVX\d]+\b'
+        }
+        for term, pattern in structural_terms.items():
             if re.search(pattern, query_lower):
                 analysis["structural_markers"].append(term)
 
@@ -414,10 +353,38 @@ class GraphSearchTool(CodedTool):
                 analysis["paragraph_refs"].append(para_ref)
 
         # Detect chronological/temporal direction queries
+        chronological_earliest = [
+            "first", "originally", "initially", "created", "creates",
+            "established", "establishes", "founded", "founds",
+            "inception", "origin", "earliest", "when was",
+            "who created", "who established", "which decision created",
+            "which decision established", "which decision creates",
+            "set up", "sets up", "launched", "launches",
+        ]
+        chronological_latest = [
+            "latest", "most recent", "current", "last updated", "newest",
+        ]
+        # Detect timeline/evolution queries (all decisions on a topic)
+        timeline_markers = [
+            "all decisions", "every decision", "timeline", "evolution",
+            "history of", "how did", "what decisions were made",
+            "what decisions address", "complete history",
+            "chronolog", "over time", "across sessions", "track",
+            "follow-up", "follow up", "review timing", "review cycle",
+            "reporting cycle", "subsequent", "later sessions",
+            "multiple sessions", "across multiple", "governance",
+        ]
         # Detect identification queries (user describes a decision by content, not by ID)
         # e.g., "A later CMA decision creates a new network to support developing countries"
+        identification_markers = [
+            "a decision", "a later decision", "a cma decision", "a cop decision",
+            "a cmp decision", "the decision that", "which decision",
+            "which cma decision", "which cop decision", "which cmp decision",
+            "identify the decision", "find the decision",
+            "a later cma", "a later cop", "a later cmp",
+        ]
         is_identification = any(
-            marker in query_lower for marker in self.IDENTIFICATION_MARKERS
+            marker in query_lower for marker in identification_markers
         )
         # Also detect descriptive patterns: "[conference] decision [verb]s..."
         if not is_identification and re.search(
@@ -426,16 +393,16 @@ class GraphSearchTool(CodedTool):
             is_identification = True
         # Long descriptive queries about what a decision does are likely identification
         if not is_identification and len(query.split()) > 15 and any(
-            conf.lower() in query_lower for conf in self.CONFERENCE_TYPES
+            conf.lower() in query_lower for conf in conference_types
         ):
             is_identification = True
 
         analysis["is_identification_query"] = is_identification
 
-        if any(marker in query_lower for marker in self.CHRONOLOGICAL_EARLIEST_MARKERS):
+        if any(marker in query_lower for marker in chronological_earliest):
             analysis["temporal_direction"] = "earliest"
             analysis["follow_references"] = True
-        elif any(marker in query_lower for marker in self.CHRONOLOGICAL_LATEST_MARKERS):
+        elif any(marker in query_lower for marker in chronological_latest):
             analysis["temporal_direction"] = "latest"
             analysis["follow_references"] = False
         else:
@@ -443,13 +410,20 @@ class GraphSearchTool(CodedTool):
             analysis["follow_references"] = False
 
         analysis["is_timeline_query"] = any(
-            marker in query_lower for marker in self.TIMELINE_MARKERS
+            marker in query_lower for marker in timeline_markers
         )
 
         # Detect multi-stage governance evolution queries
         # When a query describes multiple governance phases, treat as timeline query
         # e.g., "creates a body... and also sets out follow-up actions... and future review timing"
-        phase_count = sum(1 for m in self.GOVERNANCE_PHASE_MARKERS if m in query_lower)
+        governance_phase_markers = [
+            "establishes", "creates", "set up", "sets up",  # Phase 1: creation
+            "follow-up", "follow up", "operationalize",     # Phase 2: operationalization
+            "review", "reporting", "integration", "mandate", # Phase 3: review/integration
+            "recommendations", "workplan", "work plan",
+            "annual report", "midterm review",
+        ]
+        phase_count = sum(1 for m in governance_phase_markers if m in query_lower)
         if phase_count >= 2 and not analysis["is_timeline_query"]:
             analysis["is_timeline_query"] = True
             print(f"Multi-stage governance query detected ({phase_count} phases mentioned)")
@@ -473,8 +447,8 @@ class GraphSearchTool(CodedTool):
         elif complexity_score <= 2:
             analysis["complexity"] = "low"
 
-        # Force high complexity for temporal/timeline/identification queries
-        if analysis.get("temporal_direction") or analysis.get("is_timeline_query") or analysis.get("is_identification_query"):
+        # Force high complexity for temporal/timeline/identification/enumeration queries
+        if analysis.get("temporal_direction") or analysis.get("is_timeline_query") or analysis.get("is_identification_query") or analysis.get("is_enumeration_query"):
             analysis["complexity"] = "high"
 
         # Recommend search type based on analysis
@@ -511,9 +485,18 @@ class GraphSearchTool(CodedTool):
 
         # PRIORITY 0: If specific decision is referenced, search for it directly
         decision_results = []
+        annex_results = []
         if query_analysis.get("decision_id"):
-            print(f"Detected specific decision reference: {query_analysis['decision_id']}, searching directly...")
-            decision_results = await self._search_by_decision(query_analysis["decision_id"], query)
+            decision_id = query_analysis["decision_id"]
+            print(f"Detected specific decision reference: {decision_id}, searching directly...")
+            decision_results = await self._search_by_decision(decision_id, query)
+
+            # PRIORITY 0A: Also search for annexes of the referenced decision
+            # Annexes contain detailed work programmes, enumerated areas, modalities, etc.
+            # that the main decision text only references briefly.
+            annex_results = await self._search_decision_annexes(decision_id, query)
+            if annex_results:
+                print(f"Found {len(annex_results)} annex(es) for Decision {decision_id}")
 
         # PRIORITY 1: If specific paragraphs are referenced, try paragraph-based search
         paragraph_results = []
@@ -542,6 +525,11 @@ class GraphSearchTool(CodedTool):
         ):
             episode_limit = max(episode_limit, 15)
             print(f"Boosted episode limit to {episode_limit} for timeline/evolution query")
+
+        # Boost episode limit for enumeration queries (need more content to find lists)
+        if query_analysis.get("is_enumeration_query"):
+            episode_limit = max(episode_limit, 10)
+            print(f"Boosted episode limit to {episode_limit} for enumeration query")
 
         # Stage 1: Find relevant entities (reduced limit for speed)
         print(f"Stage 1: Searching entities (limit={entity_limit})")
@@ -634,11 +622,24 @@ class GraphSearchTool(CodedTool):
         if decision_results:
             output_parts.append("=" * 80)
             output_parts.append("SPECIFIC DECISION (EXACT MATCH)")
-            output_parts.append(f"Direct result for the decision referenced in your query")
+            output_parts.append("Direct result for the decision referenced in your query")
             output_parts.append("=" * 80)
             output_parts.append("")
             output_parts.append(decision_results)
             output_parts.append("")
+
+        # PRIORITY 0A+: Decision annexes (contain detailed content like work programmes)
+        if annex_results:
+            output_parts.append("=" * 80)
+            output_parts.append("DECISION ANNEXES (DETAILED CONTENT)")
+            output_parts.append("Annexes contain work programmes, enumerated areas, modalities,")
+            output_parts.append("and other structured detail that the main decision text references.")
+            output_parts.append("CHECK THESE for specific lists, areas of work, and detailed provisions.")
+            output_parts.append("=" * 80)
+            output_parts.append("")
+            for annex_result in annex_results:
+                output_parts.append(annex_result)
+                output_parts.append("")
 
         # PRIORITY 0B: Specific paragraphs from metadata (HIGHEST PRIORITY for paragraph queries)
         if paragraph_results:
@@ -733,13 +734,25 @@ class GraphSearchTool(CodedTool):
             output_parts.append(rel_text)
             output_parts.append("")
 
-        if not decision_results and not paragraph_results and not referenced_decisions and not timeline_results and not episode_results and not entity_results and not relationship_results:
+        if not decision_results and not annex_results and not paragraph_results and not referenced_decisions and not timeline_results and not episode_results and not entity_results and not relationship_results:
             output_parts.append("No results found across all search stages.")
             output_parts.append("")
             output_parts.append("Suggestions:")
             output_parts.append("- Try broader search terms")
             output_parts.append("- Check spelling of technical terms")
             output_parts.append("- Verify the concept exists in UNFCCC documents")
+
+        # Anti-hallucination guidance
+        output_parts.append("")
+        output_parts.append("=" * 80)
+        output_parts.append("IMPORTANT INSTRUCTIONS FOR ANSWER SYNTHESIS:")
+        output_parts.append("- ONLY state facts that appear in the search results above")
+        output_parts.append("- If the answer is not in the results, say so explicitly")
+        output_parts.append("- Do NOT project or speculate about future sessions or dates")
+        output_parts.append("- When listing items (areas of work, elements, etc.), ")
+        output_parts.append("  check ANNEXES first — detailed lists are usually there")
+        output_parts.append("- Cite specific decision IDs and paragraph numbers")
+        output_parts.append("=" * 80)
 
         formatted_output = "\n".join(output_parts)
 
@@ -751,6 +764,7 @@ class GraphSearchTool(CodedTool):
         # Return combined results and formatted output
         combined_results = {
             "decision": decision_results,
+            "annexes": annex_results,
             "paragraphs": paragraph_results,
             "referenced_decisions": referenced_decisions,
             "timeline": timeline_results,
@@ -890,6 +904,9 @@ class GraphSearchTool(CodedTool):
         :raises: Exception if search fails
         """
         try:
+            from graphiti_core.search.search_config_recipes import \
+                NODE_HYBRID_SEARCH_RRF
+
             print(f"Searching entities: query='{query[:50]}...', limit={limit}")
             config = NODE_HYBRID_SEARCH_RRF.model_copy(deep=True)
             config.limit = limit
@@ -915,6 +932,9 @@ class GraphSearchTool(CodedTool):
         :raises: Exception if search fails
         """
         try:
+            from graphiti_core.search.search_config_recipes import \
+                EDGE_HYBRID_SEARCH_RRF
+
             print(f"Searching relationships: query='{query[:50]}...', limit={limit}")
             config = EDGE_HYBRID_SEARCH_RRF.model_copy(deep=True)
             config.limit = limit
@@ -945,6 +965,10 @@ class GraphSearchTool(CodedTool):
         :raises: Exception if search fails
         """
         try:
+            from graphiti_core.search.search_config_recipes import (
+                COMBINED_HYBRID_SEARCH_RRF
+            )
+
             # **ENHANCED SEARCH QUALITY**: Expand query with UNFCCC-specific terminology
             expanded_query = self._expand_query_terms(query)
             print(f"Searching episodes: original='{query[:50]}...', expanded='{expanded_query[:70]}...'")
@@ -977,6 +1001,10 @@ class GraphSearchTool(CodedTool):
         :return: Formatted decision text or empty string if not found
         """
         try:
+            from graphiti_core.search.search_config_recipes import (
+                COMBINED_HYBRID_SEARCH_RRF
+            )
+
             # Strategy 1: Semantic search + metadata matching
             search_query = f"decision {decision_id}"
             print(f"Searching for decision: {decision_id}")
@@ -1012,6 +1040,7 @@ class GraphSearchTool(CodedTool):
 
         except Exception as e:
             print(f"Error during decision search: {e}")
+            import traceback
             traceback.print_exc()
             return ""
 
@@ -1027,17 +1056,14 @@ class GraphSearchTool(CodedTool):
         action_type = metadata.get("decision_action_type", "")
         action_label = f" [{action_type.upper()}]" if action_type else ""
 
-        parts = [
-            f">>> DECISION {decision_id} ({year}){action_label} <<<",
-            f"Conference: {conference}",
-            f"Year: {year}, Location: {location}",
-            "",
-            "EXACT TEXT FROM SOURCE:",
-            "-" * 80,
-            episode_content,
-        ]
+        formatted_result = f">>> DECISION {decision_id} ({year}){action_label} <<<\n"
+        formatted_result += f"Conference: {conference}\n"
+        formatted_result += f"Year: {year}, Location: {location}\n"
+        formatted_result += f"\nEXACT TEXT FROM SOURCE:\n"
+        formatted_result += "-" * 80 + "\n"
+        formatted_result += f"{episode_content}\n"
 
-        return "\n".join(parts)
+        return formatted_result
 
     async def _search_decision_by_cypher(self, decision_id: str) -> str:
         """
@@ -1080,24 +1106,125 @@ class GraphSearchTool(CodedTool):
 
                 print(f"Found decision via direct Cypher: {name}")
 
-                parts = [
-                    f">>> DECISION {decision_id} <<<",
-                    f"Source: {source_desc or name}",
-                    "",
-                    "EXACT TEXT FROM SOURCE:",
-                    "-" * 80,
-                    content,
-                ]
+                formatted_result = f">>> DECISION {decision_id} <<<\n"
+                formatted_result += f"Source: {source_desc or name}\n"
+                formatted_result += f"\nEXACT TEXT FROM SOURCE:\n"
+                formatted_result += "-" * 80 + "\n"
+                formatted_result += f"{content}\n"
 
-                return "\n".join(parts)
+                return formatted_result
 
             print(f"Direct Cypher query found no results for Decision {decision_id}")
             return ""
 
         except Exception as e:
             print(f"Error during direct Cypher search: {e}")
+            import traceback
             traceback.print_exc()
             return ""
+
+    async def _search_decision_annexes(
+        self, decision_id: str, query: str = ""
+    ) -> List[str]:
+        """
+        Search for annex episodes belonging to a specific decision.
+
+        UNFCCC decisions often contain annexes with detailed work programmes,
+        enumerated areas of work, modalities, and other structured content that
+        the main decision text only references briefly.
+
+        Large annexes are split into sub-section episodes at ingestion time,
+        so this method returns granular, pre-chunked annex sections that
+        Graphiti has already extracted entities and relationships from.
+
+        :param decision_id: Decision ID (e.g., "7/CMA.1")
+        :param query: Original user query (unused, kept for API compatibility)
+        :return: List of formatted annex result strings
+        """
+        if not GraphSearchTool._driver_instance:
+            return []
+
+        try:
+            decision_id_clean = decision_id.strip().upper()
+            print(f"Searching for annexes of Decision {decision_id_clean}...")
+
+            # Strategy 1: Search by name containing decision ID + annex keyword
+            # This finds both full annexes and annex sub-sections (ingested with
+            # titles like "Annex I to Decision 7/CMA.1 — I. Economic diversification")
+            cypher_query = """
+            MATCH (e:Episodic)
+            WHERE (e.source_description CONTAINS $decision_id
+                   OR toUpper(e.name) CONTAINS $decision_id_upper)
+               AND (toLower(e.name) CONTAINS 'annex'
+                    OR toLower(e.content) CONTAINS 'annex')
+            RETURN e.name as name, e.content as content,
+                   e.source_description as source_description
+            ORDER BY e.name
+            LIMIT 20
+            """
+
+            records, _, _ = await GraphSearchTool._driver_instance.execute_query(
+                cypher_query,
+                decision_id=decision_id_clean,
+                decision_id_upper=decision_id_clean,
+            )
+
+            if not records:
+                # Strategy 2: Broader search using decision ID in content
+                cypher_query_broad = """
+                MATCH (e:Episodic)
+                WHERE (toUpper(e.name) CONTAINS $search_term
+                       OR toUpper(e.content) CONTAINS $search_term)
+                  AND (toLower(e.name) CONTAINS 'annex'
+                       OR toLower(e.content) STARTS WITH 'annex')
+                RETURN e.name as name, e.content as content,
+                       e.source_description as source_description
+                ORDER BY e.name
+                LIMIT 20
+                """
+                search_term = f"DECISION {decision_id_clean}"
+                records, _, _ = await GraphSearchTool._driver_instance.execute_query(
+                    cypher_query_broad,
+                    search_term=search_term,
+                )
+
+            if not records:
+                print(f"No annexes found for Decision {decision_id_clean}")
+                return []
+
+            results = []
+            for record in records:
+                record_dict = dict(record)
+                name = record_dict.get("name", "Unknown")
+                content = record_dict.get("content", "")
+                source_desc = record_dict.get("source_description", "")
+
+                import re
+                annex_match = re.search(r'[Aa]nnex\s*([IVXivx\d]+)', name)
+                annex_label = annex_match.group(0) if annex_match else "Annex"
+
+                # Check if this is a sub-section episode (contains em dash separator)
+                is_sub_section = "\u2014" in name
+                if is_sub_section:
+                    formatted = f">>> {annex_label.upper()} to Decision {decision_id} (section) <<<\n"
+                    formatted += f"Section: {name}\n"
+                else:
+                    formatted = f">>> {annex_label.upper()} to Decision {decision_id} <<<\n"
+                formatted += f"Source: {source_desc or name}\n"
+                formatted += "-" * 80 + "\n"
+                formatted += f"{content}\n"
+                results.append(formatted)
+
+                print(f"Found annex: {name} ({len(content)} chars)")
+
+            print(f"Found {len(results)} annex(es)/section(s) for Decision {decision_id_clean}")
+            return results
+
+        except Exception as e:
+            print(f"Error searching for annexes: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
 
     async def _search_by_paragraph(
         self, query: str, query_analysis: Dict[str, Any]
@@ -1113,6 +1240,8 @@ class GraphSearchTool(CodedTool):
         :param query_analysis: Analysis results containing paragraph_refs
         :return: List of formatted paragraph results
         """
+        import re
+
         paragraph_refs = query_analysis.get("paragraph_refs", [])
         if not paragraph_refs:
             return []
@@ -1135,6 +1264,10 @@ class GraphSearchTool(CodedTool):
         print(f"Searching for episodes containing decision: {decision_id or 'unknown (using query)'}")
 
         try:
+            from graphiti_core.search.search_config_recipes import (
+                COMBINED_HYBRID_SEARCH_RRF
+            )
+
             # Use combined search to find episodes
             config = COMBINED_HYBRID_SEARCH_RRF.model_copy(deep=True)
             config.limit = 10  # Get more candidates to find the right decision
@@ -1181,14 +1314,11 @@ class GraphSearchTool(CodedTool):
                         episode_name = episode.name if hasattr(episode, 'name') else 'Unknown'
                         decision_from_metadata = episode.metadata.get("decision_id", "Unknown")
 
-                        parts = [
-                            f"**Paragraph {para_id}** from {decision_from_metadata}",
-                            f"Source: {episode_name}",
-                            "",
-                            para_text,
-                        ]
+                        formatted_result = f"**Paragraph {para_id}** from {decision_from_metadata}\n"
+                        formatted_result += f"Source: {episode_name}\n"
+                        formatted_result += f"\n{para_text}\n"
 
-                        results.append("\n".join(parts))
+                        results.append(formatted_result)
                         found = True
                         print(f"Found paragraph {para_id} in episode: {episode_name}")
                         break
@@ -1198,6 +1328,7 @@ class GraphSearchTool(CodedTool):
 
         except Exception as e:
             print(f"Error during paragraph metadata search: {e}")
+            import traceback
             traceback.print_exc()
 
         return results
@@ -1221,8 +1352,23 @@ class GraphSearchTool(CodedTool):
         query_lower = query.lower()
         expansions = []
 
+        # UNFCCC terminology mappings
+        term_mappings = {
+            "mitigation co-benefits": ["co-benefits from mitigation", "mitigation benefits", "ancillary benefits"],
+            "adaptation action": ["adaptation activities", "adaptation measures", "adaptation efforts"],
+            "economic diversification": ["diversification plans", "economic transformation", "structural transformation"],
+            "additional information": ["further information", "supplementary information", "more detailed information"],
+            "Party": ["country", "nation", "State Party", "Parties"],
+            "must provide": ["shall provide", "required to provide", "obligation to provide", "provide"],
+            "transparency": ["transparency framework", "ETF", "enhanced transparency framework"],
+            "reporting": ["report", "BTR", "biennial transparency report", "national communication"],
+            "NDC": ["nationally determined contribution", "nationally determined contributions"],
+            "annex": ["annexes", "appendix", "attachment"],
+            "decision": ["decisions", "decision document"],
+        }
+
         # Add expansion terms if key phrases are found
-        for key_phrase, synonyms in self.QUERY_TERM_MAPPINGS.items():
+        for key_phrase, synonyms in term_mappings.items():
             if key_phrase in query_lower:
                 # Add the most relevant synonyms (limit to avoid over-expansion)
                 expansions.extend(synonyms[:2])
@@ -1243,8 +1389,17 @@ class GraphSearchTool(CodedTool):
         :param conference_type: Conference type to filter by (e.g., "CMA", "COP", "CMP")
         :return: Filtered list of results matching the conference type
         """
+        import re as re_mod
+
         # Normalize conference type aliases
-        target_aliases = self.CONF_ALIASES.get(conference_type, [conference_type])
+        conf_aliases = {
+            "COP": ["COP", "CP"],
+            "CMA": ["CMA"],
+            "CMP": ["CMP"],
+            "SBI": ["SBI"],
+            "SBSTA": ["SBSTA"],
+        }
+        target_aliases = conf_aliases.get(conference_type, [conference_type])
 
         filtered = []
         for episode in results:
@@ -1282,6 +1437,8 @@ class GraphSearchTool(CodedTool):
         :param direction: 'earliest' to sort ascending, 'latest' to sort descending
         :return: Re-ranked list of results
         """
+        import re as re_mod
+
         def get_year(episode) -> int:
             metadata = getattr(episode, 'metadata', None) or {}
             year_str = metadata.get('year', '')
@@ -1291,7 +1448,7 @@ class GraphSearchTool(CodedTool):
                 except (ValueError, TypeError):
                     pass
             name = getattr(episode, 'name', '') or ''
-            year_match = re.search(r'(\d{4})', name)
+            year_match = re_mod.search(r'(\d{4})', name)
             if year_match:
                 y = int(year_match.group(1))
                 if 2000 <= y <= 2030:
@@ -1311,11 +1468,13 @@ class GraphSearchTool(CodedTool):
         :param episode_results: List of episode results to classify
         :return: Dict with 'founding_episodes', 'followup_episodes', and 'summary'
         """
-        creation_re = re.compile(
+        import re as re_mod
+
+        creation_re = re_mod.compile(
             r'(?i)\b(establishes?\b|creates?\b|decides\s+to\s+establish\b|'
             r'launches?\b|sets?\s+up\b|inaugurates?\b)'
         )
-        followup_re = re.compile(
+        followup_re = re_mod.compile(
             r'(?i)\b(further\s+develops?\b|also\s+recalling\b|'
             r'builds?\s+on\b|welcomes?\s+the\s+continued\b|reaffirms?\b|'
             r'operationaliz\w+\b|decides\s+that\s+.{5,40}shall\s+have\b)'
@@ -1367,6 +1526,8 @@ class GraphSearchTool(CodedTool):
         :param episode_results: List of episode results to scan for backward references
         :return: List of formatted decision result strings
         """
+        import re as re_mod
+
         referenced_decision_ids = set()
         for episode in episode_results:
             content = getattr(episode, 'content', '') or ''
@@ -1377,7 +1538,7 @@ class GraphSearchTool(CodedTool):
                 r'(?:decision|resolution)\s+(\d+/[A-Z]+\.\d+)',
             ]
             for pattern in recall_patterns:
-                for match in re.finditer(pattern, content, re.IGNORECASE):
+                for match in re_mod.finditer(pattern, content, re_mod.IGNORECASE):
                     ref_id = match.group(1).upper()
                     referenced_decision_ids.add(ref_id)
 
@@ -1404,6 +1565,8 @@ class GraphSearchTool(CodedTool):
         :param limit: Maximum number of episodes to search
         :return: List of formatted timeline entry strings, sorted chronologically
         """
+        import re as re_mod
+
         # Search broadly for episodes on this topic
         episode_results = await self._search_episodes(query, limit)
         if not episode_results:
@@ -1423,9 +1586,9 @@ class GraphSearchTool(CodedTool):
             if not decision_id or decision_id in seen_ids:
                 # Fall back to extracting from episode name
                 name = getattr(episode, 'name', '') or ''
-                name_match = re.search(
+                name_match = re_mod.search(
                     r'(?:Decision|Resolution)\s+(?:No\.?\s*)?([\dIVXLC]+(?:\s*/\s*[A-Za-z]+\.\d+))',
-                    name, re.IGNORECASE
+                    name, re_mod.IGNORECASE
                 )
                 if name_match:
                     decision_id = name_match.group(1).strip()
@@ -1440,11 +1603,11 @@ class GraphSearchTool(CodedTool):
             content = getattr(episode, 'content', '') or ''
 
             # Classify as founding or follow-up
-            creation_re = re.compile(
+            creation_re = re_mod.compile(
                 r'(?i)\b(establishes?|creates?|decides\s+to\s+establish|'
                 r'launches?|sets?\s+up)\b'
             )
-            followup_re = re.compile(
+            followup_re = re_mod.compile(
                 r'(?i)\b(further\s+develops?|also\s+recalling|'
                 r'welcomes?\s+the\s+continued|reaffirms?)\b'
             )
@@ -1457,14 +1620,16 @@ class GraphSearchTool(CodedTool):
             else:
                 action_type = "RELATED"
 
-            # Extract first substantive sentence as summary
-            first_para = content[:500].split('\n')
-            summary_line = ""
-            for line in first_para:
+            # Extract substantive lines as summary (more depth for traces)
+            content_lines = content[:2000].split('\n')
+            summary_lines = []
+            for line in content_lines:
                 line = line.strip()
                 if len(line) > 30 and not line.startswith("Conference"):
-                    summary_line = line[:200]
-                    break
+                    summary_lines.append(line)
+                    if len(summary_lines) >= 3:
+                        break
+            summary_text = " ".join(summary_lines)[:500]
 
             conference = metadata.get('conference_type', '')
             session = metadata.get('session_number', '')
@@ -1472,7 +1637,7 @@ class GraphSearchTool(CodedTool):
             formatted = (
                 f"[{year}] Decision {decision_id} ({conference} Session {session}"
                 f"{', ' + location if location else ''}) "
-                f"— {action_type}: {summary_line}"
+                f"— {action_type}:\n  {summary_text}"
             )
             decisions.append((year, formatted))
 
@@ -1483,9 +1648,9 @@ class GraphSearchTool(CodedTool):
         backward_ids = set()
         for episode in episode_results:
             content = getattr(episode, 'content', '') or ''
-            for match in re.finditer(
+            for match in re_mod.finditer(
                 r'(?:recalling|also recalling)\s+(?:decision|resolution)\s+(\d+/[A-Z]+\.\d+)',
-                content, re.IGNORECASE
+                content, re_mod.IGNORECASE
             ):
                 ref_id = match.group(1).upper()
                 if ref_id not in seen_ids:
@@ -1517,10 +1682,19 @@ class GraphSearchTool(CodedTool):
         source_lower = source_text.lower()
 
         # Extract key terms from claim (nouns, verbs, adjectives)
-        # Extract words, filter common stop words and short words
+        import re
+        # Remove common words
+        common_words = {
+            "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for",
+            "of", "with", "by", "from", "is", "are", "was", "were", "be", "been",
+            "has", "have", "had", "do", "does", "did", "will", "would", "should",
+            "could", "may", "might", "must", "shall", "can"
+        }
+
+        # Extract words, filter common words and short words
         claim_words = [
             word for word in re.findall(r'\b\w+\b', claim_lower)
-            if word not in self.COMMON_STOP_WORDS and len(word) > 3
+            if word not in common_words and len(word) > 3
         ]
 
         # Check how many key terms appear in source
@@ -1563,6 +1737,7 @@ class GraphSearchTool(CodedTool):
         :param fact: The fact statement to break down
         :return: List of individual claims
         """
+        import re
         # Split on common conjunctions and semicolons
         claims = re.split(r'[;]|\band\b|\bor\b|\balso\b|\bfurthermore\b|\badditionally\b', fact, flags=re.IGNORECASE)
 
@@ -1619,12 +1794,12 @@ class GraphSearchTool(CodedTool):
                 output_parts.append(f"\nSource Documents: {len(episode_uuids)} episode(s)")
                 # Fetch episode metadata for proper citations
                 for ep_uuid in episode_uuids[:3]:  # Limit to first 3 for brevity
-                    ep_citation_data = await self._get_episode_citation_data(ep_uuid)
-                    if ep_citation_data:
+                    ep_metadata = await self._get_episode_metadata(ep_uuid)
+                    if ep_metadata:
                         citation = self._build_citation(
-                            ep_citation_data.get("name", ""),
-                            ep_citation_data.get("metadata", {}),
-                            ep_citation_data.get("source_description", "")
+                            ep_metadata.get("name", ""),
+                            ep_metadata.get("metadata", {}),
+                            ep_metadata.get("source_description", "")
                         )
                         if citation:
                             output_parts.append(f"  • {citation}")
@@ -1669,15 +1844,12 @@ class GraphSearchTool(CodedTool):
 
         return "\n".join(output_parts)
 
-    async def _get_episode_citation_data(self, episode_uuid: str) -> Dict[str, Any]:
+    async def _get_episode_metadata(self, episode_uuid: str) -> Dict[str, Any]:
         """
-        Fetch episode data for building citations.
-
-        Queries Episodic nodes for name, source_description, content, and source
-        fields used by _build_citation.
+        Fetch episode metadata for citation purposes.
 
         :param episode_uuid: Episode UUID to look up
-        :return: Dictionary with episode citation data or empty dict if not found
+        :return: Dictionary with episode metadata or empty dict if not found
         """
         if not GraphSearchTool._driver_instance:
             return {}
@@ -1700,6 +1872,7 @@ class GraphSearchTool(CodedTool):
                 if source:
                     # Parse source for decision_id, conference info, etc.
                     # This is a simplified parser - adjust based on actual data format
+                    import re
                     decision_match = re.search(r'decision[s]?\s*(\d+/[A-Z]+\.\d+)', source, re.IGNORECASE)
                     if decision_match:
                         metadata["decision_id"] = decision_match.group(1)
@@ -1977,6 +2150,7 @@ class GraphSearchTool(CodedTool):
             title_part = episode_name.split("::", 1)[1] if "::" in episode_name else ""
             if "Decision" in title_part or "Resolution" in title_part:
                 # Extract decision number from title
+                import re
                 match = re.search(
                     r"(?:Decision|Resolution)\s+(?:No\.?\s*)?([\dIVXLC]+(?:/[A-Za-z]+\.\d+)?)",
                     title_part

@@ -10,39 +10,21 @@
 # END COPYRIGHT
 # pylint: disable=too-many-lines,wrong-import-position
 """
-UNFCCC Climate Document Ingestion for FalkorDB Knowledge Graph.
+Base class for UNFCCC Climate Document Ingestion.
 
-This module ingests United Nations Framework Convention on Climate Change (UNFCCC)
-documents into a FalkorDB-backed knowledge graph using the Graphiti framework.
+Provides shared document parsing, metadata extraction, reference detection,
+episode construction, checkpoint-based resume, and demonstration query logic
+used by both FalkorDB and Neo4j ingestion backends.
 
-Key Features:
-    - Parses UNFCCC COP, CMA, CMP, SBI, and SBSTA decision documents
-    - Extracts structured information: decisions, resolutions, annexes, and paragraphs
-    - Identifies and extracts cross-document references between decisions
-    - Supports incremental processing with checkpoint-based resume functionality
-    - Includes performance optimizations for large-scale graph operations
-
-Document Structure:
-    - Splits documents by decisions/resolutions as primary sections
-    - Separates annexes into distinct episodes
-    - Extracts numbered paragraphs for granular reference access
-    - Preserves metadata: conference type, year, session, location, FCCC references
-
-Reference Extraction:
-    - Decision references (e.g., "decision 1/CP.21, paragraph 69")
-    - Article references (e.g., "Article 6 of the Paris Agreement")
-    - Annex references (e.g., "Annex I to decision 4/CMA.1")
-    - Paragraph references with optional decision context
-
-Note:
-    Reference linking, annex linking, and conference linking features have been
-    disabled to reduce episode count and improve processing performance. References
-    are still extracted and stored in episode metadata for potential future use.
+Subclasses must implement:
+    - DB_NAME: Class attribute with the database display name
+    - _connection_config(): Returns database-specific config keys
+    - _log_connection_info(): Logs database-specific connection details
+    - _create_graphiti_client(): Creates and returns a configured Graphiti instance
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 import re
@@ -59,195 +41,20 @@ from neuro_san.interfaces.coded_tool import CodedTool
 
 from dotenv import load_dotenv
 
-# Load environment variables before importing graphiti modules.
-# The graphiti_core.embedder.client reads EMBEDDING_DIM at import time.
 _current_dir = Path(__file__).parent
 load_dotenv(dotenv_path=_current_dir / ".env")
 
-# Monkey patch FalkorDB search functions to prevent query timeout issues.
-import graphiti_core.search.search_filters as search_filters_module
-import graphiti_core.search.search_utils as search_utils_module
 from graphiti_core import Graphiti
-from graphiti_core.driver.driver import GraphDriver
-from graphiti_core.driver.driver import GraphProvider
-from graphiti_core.driver.falkordb_driver import FalkorDriver
-from graphiti_core.edges import EntityEdge
 from graphiti_core.nodes import EpisodeType
 from graphiti_core.search.search_config_recipes import NODE_HYBRID_SEARCH_RRF
 
-_original_edge_search_filter = (
-    search_filters_module.edge_search_filter_query_constructor
-)
-_original_edge_fulltext_search = search_utils_module.edge_fulltext_search
 
+class BaseIngestionTool(CodedTool):  # pylint: disable=too-many-instance-attributes,too-many-public-methods
+    """Base class for UNFCCC climate document ingestion into a knowledge graph.
 
-def patched_edge_search_filter_query_constructor(
-    filters, provider: GraphProvider
-) -> tuple[list[str], dict[str, Any]]:
-    """Prevents FalkorDB query timeouts by normalizing empty edge UUID lists.
-
-    Converts empty edge_uuids lists to None to avoid inefficient query patterns
-    that cause timeouts in FalkorDB when filtering with empty collections.
-
-    Args:
-        filters: Search filter object potentially containing edge_uuids list.
-        provider: Graph database provider instance.
-
-    Returns:
-        Tuple of query parts and parameters for edge search filtering.
-    """
-    if (
-        hasattr(filters, "edge_uuids")
-        and filters.edge_uuids is not None
-        and len(filters.edge_uuids) == 0
-    ):
-        filters.edge_uuids = None
-    return _original_edge_search_filter(filters, provider)
-
-
-async def patched_edge_fulltext_search(
-    driver: GraphDriver,
-    query: str,
-    search_filter,
-    group_ids: list[str] | None = None,
-    limit: int = 10,
-) -> list[EntityEdge]:
-    """Optimizes edge search performance by using direct lookups instead of full-text search.
-
-    For large knowledge graphs, full-text search becomes prohibitively slow. This
-    patched version uses direct UUID-based lookups when edge_uuids are provided,
-    falling back to empty results for unrestricted searches to maintain performance.
-
-    Args:
-        driver: Graph database driver instance.
-        query: Search query string (used only in fallback).
-        search_filter: Filter object with optional edge_uuids constraint.
-        group_ids: Optional list of group IDs to filter results.
-        limit: Maximum number of results to return.
-
-    Returns:
-        List of EntityEdge objects matching the search criteria.
-    """
-
-    # Treat empty edge_uuids list as None
-    if (
-        hasattr(search_filter, "edge_uuids")
-        and search_filter.edge_uuids is not None
-        and len(search_filter.edge_uuids) == 0
-    ):
-        search_filter.edge_uuids = None
-
-    # For large graphs, full-text search is too slow. If no specific edge_uuids
-    # are provided, skip full-text search and rely on vector similarity instead.
-    if not hasattr(search_filter, "edge_uuids") or search_filter.edge_uuids is None:
-        return []
-
-    # For small UUID lists, direct lookup is much faster than full-text search
-    if (
-        hasattr(search_filter, "edge_uuids")
-        and search_filter.edge_uuids is not None
-        and len(search_filter.edge_uuids) > 0
-        and len(search_filter.edge_uuids) <= 20
-    ):
-        match_query = """
-        MATCH (n:Entity)-[e:RELATES_TO]->(m:Entity)
-        WHERE e.uuid IN $edge_uuids
-        """
-        if group_ids is not None:
-            match_query += " AND e.group_id IN $group_ids"
-
-        match_query += """
-        RETURN
-            e.uuid AS uuid,
-            n.uuid AS source_node_uuid,
-            m.uuid AS target_node_uuid,
-            e.group_id AS group_id,
-            e.created_at AS created_at,
-            e.name AS name,
-            e.fact AS fact,
-            e.episodes AS episodes,
-            e.expired_at AS expired_at,
-            e.valid_at AS valid_at,
-            e.invalid_at AS invalid_at,
-            properties(e) AS attributes
-        LIMIT $limit
-        """
-
-        try:
-            records, _, _ = await driver.execute_query(
-                match_query,
-                edge_uuids=search_filter.edge_uuids,
-                group_ids=group_ids if group_ids else [],
-                limit=limit,
-                routing_="r",
-            )
-
-            from graphiti_core.search.search_utils import \
-                get_entity_edge_from_record  # pylint: disable=import-outside-toplevel
-
-            edges = [
-                get_entity_edge_from_record(record, driver.provider)
-                for record in records
-            ]
-            return edges
-        except Exception:  # pylint: disable=broad-exception-caught
-            # Fallback to original full-text search if direct lookup fails
-            pass
-
-    # Fallback to original implementation for other cases
-    return await _original_edge_fulltext_search(
-        driver, query, search_filter, group_ids, limit
-    )
-
-
-search_filters_module.edge_search_filter_query_constructor = (
-    patched_edge_search_filter_query_constructor
-)
-search_utils_module.edge_fulltext_search = patched_edge_fulltext_search
-
-# Patch FalkorDriver.execute_query to sanitize empty edge_uuids at the driver level.
-_original_falkor_execute_query = FalkorDriver.execute_query
-
-
-async def patched_falkor_execute_query(self, cypher_query_, **kwargs):
-    """Sanitizes query parameters to prevent FalkorDB execution errors.
-
-    Removes empty edge_uuids parameters and adjusts Cypher query syntax accordingly
-    to avoid malformed queries that would cause database errors or timeouts.
-
-    Args:
-        self: FalkorDriver instance.
-        cypher_query_: The Cypher query string to execute.
-        **kwargs: Query parameters including potential edge_uuids list.
-
-    Returns:
-        Query execution result from the original FalkorDB driver method.
-    """
-    if (
-        "edge_uuids" in kwargs
-        and isinstance(kwargs["edge_uuids"], list)
-        and len(kwargs["edge_uuids"]) == 0
-    ):
-        kwargs.pop("edge_uuids", None)
-        if "WHERE e.uuid in $edge_uuids" in cypher_query_:
-            cypher_query_ = cypher_query_.replace(
-                " WHERE e.uuid in $edge_uuids AND ", " WHERE "
-            )
-            cypher_query_ = cypher_query_.replace(" AND e.uuid in $edge_uuids", "")
-            cypher_query_ = cypher_query_.replace(" WHERE e.uuid in $edge_uuids", "")
-    return await _original_falkor_execute_query(self, cypher_query_, **kwargs)
-
-
-FalkorDriver.execute_query = patched_falkor_execute_query
-
-
-class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance-attributes
-    """Ingests UNFCCC climate documents into FalkorDB knowledge graph.
-
-    This class processes United Nations Framework Convention on Climate Change (UNFCCC)
-    documents, extracting structured information about decisions, resolutions, annexes,
-    and cross-document references. Creates a queryable knowledge graph enabling semantic
-    search, temporal analysis, and citation resolution across climate conference proceedings.
+    Provides all shared functionality for parsing UNFCCC documents, extracting
+    structured information, building episodes, and loading them into a Graphiti-backed
+    knowledge graph. Subclasses provide database-specific connection and client logic.
 
     Features:
         - Document parsing for COP, CMA, CMP, SBI, and SBSTA sessions
@@ -256,14 +63,15 @@ class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance
         - Annex identification and separation into distinct episodes
         - Paragraph-level indexing for granular access
         - Checkpoint-based resume capability for interrupted ingestion
-        - Performance optimizations for large-scale graph operations
+        - Demonstration queries for verifying graph contents
 
     Note:
         Reference linking, annex linking, and conference hierarchy features are currently
         disabled to optimize processing performance and reduce episode count.
     """
 
-    # Configure console-only logging
+    DB_NAME = ""
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(message)s",
@@ -297,15 +105,12 @@ class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance
     MAX_EPISODE_NAME_LEN = 250
     MIN_SECTION_LEN = 40
     PROCESS_SUBDIRECTORIES = True
-    ANNEX_SPLIT_THRESHOLD = 1000
 
-    # Regex patterns for document parsing
     YEAR_RE = re.compile(r"(20\d{2})")
     CONFERENCE_TYPE_RE = re.compile(
         r"(?P<type>CMA|CMP|COP|SBI|SBSTA)(?P<year>\d{4})_(?P<session>\d+)",
         re.IGNORECASE,
     )
-    # Combined pattern for both Decisions and Resolutions
     DECISION_RESOLUTION_HEADING_RE = re.compile(
         r"(?m)^(?P<h>(?:Decision|Resolution)\s+(?:No\.?\s*)?[\dIVXLC]+(?:\s*/\s*[A-Za-z]+\.\d+|"
         r"(?:\s*/\s*[A-Za-z]+(?:\.\d+)?))?[^\n]*)$"
@@ -314,7 +119,6 @@ class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance
         r"(?mi)^(?P<h>(Chapter|Section|Agenda item|Article|Part)\s+[^\n]+)$",
         re.IGNORECASE,
     )
-    # Annex pattern for metadata extraction only (not for primary splitting)
     ANNEX_HEADING_RE = re.compile(
         r"(?mi)^(?P<h>Annex(?:\s+[IVXLC]+|\s+\d+)?[^\n]*)$", re.IGNORECASE
     )
@@ -324,28 +128,20 @@ class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance
     )
     FCCC_DOC_RE = re.compile(r"(?P<fccc>FCCC/[A-Z/]+/\d{4}/[\d/A-Za-z\.]+)")
 
-    # Reference extraction patterns
-    # Matches decision/resolution references with optional paragraph numbers
     DECISION_REFERENCE_RE = re.compile(
         r"(?i)(?:decision|resolution)s?\s+(?:No\.?\s*)?"
         r"(?P<number>[\dIVXLC]+(?:\s*/\s*[A-Za-z]+\.\d+))"
         r"(?:,\s*paragraph(?:s)?\s+(?P<paragraphs>[\d\-,\s]+))?"
     )
-
-    # Matches article references with optional paragraphs and agreements
     ARTICLE_REFERENCE_RE = re.compile(
         r"(?i)Article\s+(?P<number>[\dIVXLC]+)"
         r"(?:,\s*paragraph(?:s)?\s+(?P<paragraphs>[\d\-,\s]+))?"
         r"(?:\s+of\s+the\s+(?P<agreement>[^\n,;\.]+))?"
     )
-
-    # Matches standalone paragraph references
     PARAGRAPH_REFERENCE_RE = re.compile(
         r"(?i)paragraphs?\s+(?P<paragraphs>[\d\-–,\s]+)"
         r"(?:\s+of\s+(?:decision|resolution)\s+(?P<number>[\dIVXLC]+(?:\s*/\s*[A-Za-z]+\.\d+)))?"
     )
-
-    # Matches annex references with optional decision context
     ANNEX_REFERENCE_RE = re.compile(
         r"(?i)(?:the\s+)?annex(?:\s+(?P<annex_id>[IVXLC]+|\d+))?"
         r"(?:\s+to\s+(?:decision|resolution)\s+(?P<decision_number>[\dIVXLC]+"
@@ -369,16 +165,14 @@ class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance
     ]
 
     def __init__(self) -> None:
-        """Initializes the FalkorDB ingestion tool with default configuration.
+        """Initializes the ingestion tool with default configuration.
 
         Sets up logging, loads configuration from environment variables, and
         initializes data structures for tracking decisions and references during ingestion.
         """
         self.logger = logging.getLogger(self.__class__.__name__)
         self.config: Dict[str, Any] = self._load_config()
-        # Maps decision IDs to episode names (only actual decisions, not references)
         self.decision_registry: Dict[str, str] = {}
-        # Tracks all references found during parsing
         self.reference_map: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 
     async def async_invoke(self, args: Dict[str, Any], sly_data: Dict[str, Any]) -> str:
@@ -395,13 +189,13 @@ class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance
             Summary string with counts of episodes processed, references extracted,
             and relationships created.
         """
-        del sly_data  # unused in this tool
+        del sly_data
         args = args or {}
         if args:
             self.config = self._load_config(args)
         summary = await self.run()
         return (
-            "FalkorDB ingestion completed: "
+            f"{self.DB_NAME} ingestion completed: "
             f"{summary['success']} succeeded, {summary['failed']} failed "
             f"out of {summary['prepared']} prepared episodes. "
             f"{summary['references_extracted']} references extracted and stored in metadata."
@@ -410,9 +204,9 @@ class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance
     async def run(self) -> Dict[str, int]:
         """Executes complete document ingestion pipeline.
 
-        Connects to FalkorDB, processes all documents in the configured data directory,
-        extracts structured information and references, optionally runs demonstration
-        queries, and returns processing statistics.
+        Connects to the configured database, processes all documents in the configured
+        data directory, extracts structured information and references, optionally runs
+        demonstration queries, and returns processing statistics.
 
         Returns:
             Dictionary with processing statistics:
@@ -421,13 +215,9 @@ class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance
                 - failed: Episodes that failed to process
                 - references_extracted: Total cross-document references found
         """
-        self.logger.info(
-            "Connecting to FalkorDB database at %s:%s",
-            self.config["host"],
-            self.config["port"],
-        )
+        self._log_connection_info()
         graphiti = self._create_graphiti_client()
-        self.logger.info("Successfully connected to FalkorDB")
+        self.logger.info("Successfully connected to %s", self.DB_NAME)
 
         summary: Dict[str, int] = {
             "prepared": 0,
@@ -445,7 +235,6 @@ class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance
 
             success_count, failed = await self._add_episodes(graphiti, episodes)
 
-            # Extract and count references
             total_refs = sum(len(refs) for refs in self.reference_map.values())
             summary["references_extracted"] = total_refs
             self.logger.info(
@@ -475,6 +264,69 @@ class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance
             self.logger.info("\nConnection closed")
 
         return summary
+
+    def _log_connection_info(self) -> None:
+        """Logs database-specific connection information.
+
+        Subclasses must override to log their connection details
+        (host, port, URI, etc.).
+        """
+        raise NotImplementedError
+
+    def _connection_config(self) -> Dict[str, Any]:
+        """Returns database-specific configuration keys.
+
+        Subclasses must override to provide connection settings
+        (e.g., host/port for FalkorDB, URI/user/password for Neo4j).
+
+        Returns:
+            Dictionary of database connection configuration.
+        """
+        raise NotImplementedError
+
+    def _create_graphiti_client(self) -> Graphiti:
+        """Creates and configures a Graphiti client for the target database.
+
+        Subclasses must override to create the appropriate Graphiti client
+        with database-specific driver configuration.
+
+        Returns:
+            Configured Graphiti client instance ready for use.
+        """
+        raise NotImplementedError
+
+    def _apply_constrained_prompts(self) -> None:
+        """Applies constrained prompts to prevent entity hallucinations.
+
+        Replaces default Graphiti entity and edge extraction prompts with
+        UNFCCC-domain-specific versions that only extract explicitly mentioned
+        entities and relationships.
+        """
+        try:
+            try:
+                from . import constrained_prompts  # pylint: disable=import-outside-toplevel
+            except ImportError:
+                import sys  # pylint: disable=import-outside-toplevel
+
+                graph_rag_dir = Path(__file__).parent
+                if str(graph_rag_dir) not in sys.path:
+                    sys.path.insert(0, str(graph_rag_dir))
+                import constrained_prompts  # pylint: disable=import-error,import-outside-toplevel
+
+            import graphiti_core.prompts.extract_edges as extract_edges_module  # noqa: E501  pylint: disable=import-outside-toplevel
+            import graphiti_core.prompts.extract_nodes as extract_nodes_module  # noqa: E501  pylint: disable=import-outside-toplevel
+
+            extract_nodes_module.extract_text = (
+                constrained_prompts.extract_text_constrained
+            )
+            extract_edges_module.edge = constrained_prompts.extract_edges_constrained
+
+            self.logger.info("Applied constrained prompts to prevent hallucinations")
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            self.logger.warning("Failed to apply constrained prompts: %s", exc)
+            self.logger.warning(
+                "Continuing with default Graphiti prompts (may cause hallucinations)"
+            )
 
     def build_episodes(  # pylint: disable=too-many-statements,too-many-locals,too-many-branches
         self, dir_path: Path
@@ -544,76 +396,19 @@ class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance
                 decision_id = self._extract_decision_id(section.get("title", ""))
                 annex_id = self._extract_annex_id(section.get("title", ""))
 
-                # Split large annexes into sub-section episodes
-                if (
-                    annex_id
-                    and len(section.get("body", "")) > self.ANNEX_SPLIT_THRESHOLD
-                ):
-                    parent_decision_id = self._extract_parent_decision_id(
-                        section.get("title", "")
-                    )
-                    annex_sub_sections = self._split_annex_into_sections(
-                        section["body"],
-                        section.get("title", f"Annex {annex_id}"),
-                        parent_decision_id or "",
-                    )
-                    if annex_sub_sections:
-                        for sub_section in annex_sub_sections:
-                            sub_name = (
-                                f"{path.stem}::{sub_section['title']}"
-                            )
-                            sub_body = self._build_episode_body(
-                                sub_section["body"], combined_metadata
-                            )
-                            sub_refs = self._extract_references(
-                                sub_section["body"], parent_decision_id
-                            )
-                            sub_paragraphs = self._extract_paragraph_index(
-                                sub_section["body"]
-                            )
-                            sub_metadata = combined_metadata.copy()
-                            sub_metadata["annex_id"] = annex_id
-                            sub_metadata["annex_section_index"] = (
-                                sub_section["section_index"]
-                            )
-                            sub_metadata["annex_section_title"] = (
-                                sub_section["title"]
-                            )
-                            if parent_decision_id:
-                                sub_metadata["parent_decision_id"] = (
-                                    parent_decision_id
-                                )
-                            if sub_refs:
-                                sub_metadata["references"] = sub_refs
-                                self.reference_map[sub_name] = sub_refs
-                            if sub_paragraphs:
-                                sub_metadata["paragraph_index"] = (
-                                    sub_paragraphs
-                                )
-                            episodes.append({
-                                "name": sub_name[: self.MAX_EPISODE_NAME_LEN],
-                                "episode_body": sub_body,
-                                "source_description": source_description,
-                                "reference_time": reference_time,
-                                "metadata": sub_metadata,
-                                "decision_id": None,
-                                "annex_id": annex_id,
-                                "references": sub_refs,
-                                "document_name": path.stem,
-                            })
-                        continue
-
                 episode_name = f"{path.stem}::{section.get('title') or f'Part {idx}'}"
                 body = self._build_episode_body(section["body"], combined_metadata)
 
                 references = self._extract_references(section["body"], decision_id)
                 paragraph_index = self._extract_paragraph_index(section["body"])
 
-                # Store in combined metadata
                 enriched_metadata = combined_metadata.copy()
                 if decision_id:
                     enriched_metadata["decision_id"] = decision_id
                     self.decision_registry[decision_id] = episode_name
+                    self._post_extract_decision_metadata(
+                        enriched_metadata, section["body"]
+                    )
 
                 if annex_id:
                     enriched_metadata["annex_id"] = annex_id
@@ -655,121 +450,18 @@ class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance
 
         return episodes
 
-    def _split_annex_into_sections(
-        self, annex_body: str, annex_title: str, parent_decision_id: str
-    ) -> List[Dict[str, Any]]:
-        """Splits a large annex into logical sub-sections for granular ingestion.
+    def _post_extract_decision_metadata(
+        self, enriched_metadata: Dict[str, Any], section_body: str
+    ) -> None:
+        """Hook for subclasses to enrich metadata after decision ID extraction.
 
-        UNFCCC annexes often contain multiple distinct sections (work programmes,
-        enumerated areas, modalities) under Roman numeral or lettered headings.
-        Splitting them into separate episodes allows Graphiti to extract entities
-        and relationships per section, enabling precise retrieval.
+        Called during build_episodes when a decision_id is found. Subclasses can
+        override to add additional metadata such as decision action classification.
 
         Args:
-            annex_body: Full text content of the annex.
-            annex_title: Title of the annex section (e.g., 'Annex I to Decision 7/CMA.1').
-            parent_decision_id: Decision ID the annex belongs to.
-
-        Returns:
-            List of sub-section dicts with 'title', 'body', and 'section_index' keys.
-            Returns empty list if the annex cannot be meaningfully split.
+            enriched_metadata: Mutable metadata dictionary to enrich.
+            section_body: Full text of the decision section.
         """
-        # Try splitting by Roman numeral headings (I., II., III., IV.)
-        roman_heading_re = re.compile(
-            r'^\s*((?:I{1,3}|IV|VI{0,3}|IX|X{0,3})\.\s+.*)$',
-            re.MULTILINE
-        )
-        sub_sections = self._split_by_headings(annex_body, roman_heading_re)
-
-        # Try letter headings (A., B., C.)
-        if len(sub_sections) <= 1:
-            letter_heading_re = re.compile(
-                r'^\s*([A-Z]\.\s+.*)$',
-                re.MULTILINE
-            )
-            sub_sections = self._split_by_headings(annex_body, letter_heading_re)
-
-        # Try numbered section headings (1., 2., 3.) but only top-level
-        if len(sub_sections) <= 1:
-            numbered_heading_re = re.compile(
-                r'^\s*(\d{1,2}\.\s+[A-Z].*)$',
-                re.MULTILINE
-            )
-            sub_sections = self._split_by_headings(annex_body, numbered_heading_re)
-
-        # Try ALL-CAPS heading lines (common in UNFCCC annexes)
-        if len(sub_sections) <= 1:
-            caps_heading_re = re.compile(
-                r'^\s*([A-Z][A-Z\s]{5,80})$',
-                re.MULTILINE
-            )
-            sub_sections = self._split_by_headings(annex_body, caps_heading_re)
-
-        # Fall back to paragraph-break splitting for unstructured annexes
-        if len(sub_sections) <= 1:
-            paragraphs = re.split(r'\n\s*\n', annex_body)
-            sub_sections = []
-            current_chunk_parts: List[str] = []
-            current_chunk_len = 0
-            chunk_idx = 0
-            for para in paragraphs:
-                para = para.strip()
-                if not para:
-                    continue
-                if current_chunk_len + len(para) > self.ANNEX_SPLIT_THRESHOLD and current_chunk_parts:
-                    chunk_idx += 1
-                    first_line = current_chunk_parts[0].split('\n')[0][:80]
-                    sub_sections.append({
-                        "title": first_line,
-                        "body": "\n\n".join(current_chunk_parts),
-                    })
-                    current_chunk_parts = [para]
-                    current_chunk_len = len(para)
-                else:
-                    current_chunk_parts.append(para)
-                    current_chunk_len += len(para)
-            if current_chunk_parts:
-                chunk_idx += 1
-                first_line = current_chunk_parts[0].split('\n')[0][:80]
-                sub_sections.append({
-                    "title": first_line,
-                    "body": "\n\n".join(current_chunk_parts),
-                })
-
-        if len(sub_sections) <= 1:
-            return []
-
-        results = []
-        for sec_idx, sub_section in enumerate(sub_sections, 1):
-            sec_title = sub_section.get("title", f"Section {sec_idx}")
-            results.append({
-                "title": f"{annex_title} \u2014 {sec_title}",
-                "body": sub_section["body"],
-                "section_index": sec_idx,
-            })
-
-        self.logger.info(
-            "Split annex '%s' into %d sub-sections",
-            annex_title[:60], len(results),
-        )
-        return results
-
-    def _extract_parent_decision_id(self, annex_title: str) -> Optional[str]:
-        """Extracts the parent decision ID from an annex title.
-
-        Args:
-            annex_title: Annex section title (e.g., 'Annex I to Decision 7/CMA.1').
-
-        Returns:
-            Decision ID (e.g., '7/CMA.1'), or None if not found.
-        """
-        match = re.search(
-            r'(?:Decision|Resolution)\s+(?:No\.?\s*)?([\dIVXLC]+(?:\s*/\s*[A-Za-z]+\.\d+))',
-            annex_title, re.IGNORECASE
-        )
-        if match:
-            return match.group(1).strip()
-        return None
 
     def _extract_decision_id(self, title: str) -> Optional[str]:
         """Extracts normalized decision or resolution identifier from section title.
@@ -790,9 +482,8 @@ class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance
         if re.match(r"(?i)^\s*Annex", title):
             return None
 
-        # Match only decisions and resolutions
         match = re.search(
-            r"(?i)(?:Decision|Resolution)\s+(?:No\.?\s*)?([\ dIVXLC]+(?:\s*/\s*[A-Za-z]+\.\d+))",
+            r"(?i)(?:Decision|Resolution)\s+(?:No\.?\s*)?([\dIVXLC]+(?:\s*/\s*[A-Za-z]+\.\d+))",
             title,
         )
         if match:
@@ -814,7 +505,6 @@ class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance
         if not title:
             return None
 
-        # Match annex headings
         match = re.match(r"(?i)^\s*Annex(?:\s+([IVXLC]+|\d+))?", title)
         if match:
             annex_id = match.group(1)
@@ -845,7 +535,6 @@ class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance
         """
         references: List[Dict[str, Any]] = []
 
-        # Extract decision/resolution references
         for match in self.DECISION_REFERENCE_RE.finditer(text):
             ref = {
                 "type": "decision",
@@ -860,7 +549,6 @@ class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance
             }
             references.append(ref)
 
-        # Extract article references
         for match in self.ARTICLE_REFERENCE_RE.finditer(text):
             ref = {
                 "type": "article",
@@ -880,7 +568,6 @@ class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance
             }
             references.append(ref)
 
-        # Extract annex references
         for match in self.ANNEX_REFERENCE_RE.finditer(text):
             annex_id = match.group("annex_id")
             decision_number = match.group("decision_number")
@@ -956,7 +643,6 @@ class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance
         """
         paragraphs: Dict[str, str] = {}
 
-        # Standard numbered paragraphs (e.g., "1.", "67.")
         numbered_pattern = r"^\s*(\d+)\.\s+(.+?)(?=^\s*\d+\.\s|\Z)"
         matches = re.finditer(numbered_pattern, text, re.MULTILINE | re.DOTALL)
 
@@ -966,7 +652,6 @@ class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance
             para_text = " ".join(para_text.split())
             paragraphs[para_num] = para_text[:1000]
 
-        # If no numbered paragraphs found, try Roman numerals (e.g., "I.", "IV.")
         if not paragraphs:
             roman_pattern = r"^\s*([IVXLC]+)\.\s+(.+?)(?=^\s*[IVXLC]+\.\s|\Z)"
             matches = re.finditer(roman_pattern, text, re.MULTILINE | re.DOTALL)
@@ -984,34 +669,23 @@ class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance
     ) -> Dict[str, Any]:
         """Loads configuration from environment variables with optional overrides.
 
-        Reads connection settings, processing parameters, and feature flags from
-        environment variables. Accepts runtime overrides for flexible configuration.
+        Merges database-specific connection settings from _connection_config() with
+        shared processing parameters. Accepts runtime overrides for flexible configuration.
 
         Args:
             overrides: Optional dictionary of configuration overrides.
 
         Returns:
-            Complete configuration dictionary with keys:
-                - host, port, username, password: Database connection settings
-                - data_dir: Path to source documents
-                - batch_size, max_episodes, search_limit: Processing parameters
-                - enable_demo_searches, verbose_logging: Feature flags
+            Complete configuration dictionary with connection and processing settings.
         """
         overrides = overrides or {}
 
         config: Dict[str, Any] = {
-            # Connection settings from environment only (no overrides allowed)
-            "host": os.environ.get("FALKORDB_HOST", "localhost"),
-            "port": os.environ.get("FALKORDB_PORT", "6379"),
-            "username": os.environ.get("FALKORDB_USERNAME"),
-            "password": os.environ.get("FALKORDB_PASSWORD"),
-            # Data source (overrideable)
+            **self._connection_config(),
             "data_dir": Path(os.environ.get("DATA_DIR", "documents")),
-            # Processing settings (overrideable)
             "batch_size": int(os.environ.get("BATCH_SIZE", "10")),
             "max_episodes": int(os.environ.get("MAX_EPISODES", "0")),
             "search_limit": int(os.environ.get("SEARCH_LIMIT", "5")),
-            # Feature toggles (overrideable)
             "enable_demo_searches": os.environ.get(
                 "ENABLE_DEMO_SEARCHES", "true"
             ).lower()
@@ -1053,54 +727,6 @@ class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance
         if isinstance(value, str):
             return value.strip().lower() in {"true", "1", "yes", "y"}
         return bool(value)
-
-    def _create_graphiti_client(self) -> Graphiti:  # pylint: disable=too-many-locals
-        """Creates and configures a Graphiti client for FalkorDB.
-
-        Initializes the Graphiti framework with FalkorDB driver and applies
-        constrained prompts to prevent entity hallucinations during graph construction.
-
-        Returns:
-            Configured Graphiti client instance ready for use.
-        """
-        graph_name = os.getenv("FALKORDB_GRAPH_NAME", "unfccc_knowledge_graph")
-
-        driver = FalkorDriver(
-            host=self.config["host"],
-            port=self.config["port"],
-            username=self.config["username"],
-            password=self.config["password"],
-            database=graph_name,
-        )
-
-        # Apply constrained prompts to prevent entity hallucinations
-        try:
-            try:
-                from . import constrained_prompts  # pylint: disable=import-outside-toplevel
-            except ImportError:
-                import sys  # pylint: disable=import-outside-toplevel
-
-                graph_rag_dir = Path(__file__).parent
-                if str(graph_rag_dir) not in sys.path:
-                    sys.path.insert(0, str(graph_rag_dir))
-                import constrained_prompts  # pylint: disable=import-error,import-outside-toplevel
-
-            import graphiti_core.prompts.extract_edges as extract_edges_module  # pylint: disable=import-outside-toplevel
-            import graphiti_core.prompts.extract_nodes as extract_nodes_module  # pylint: disable=import-outside-toplevel
-
-            extract_nodes_module.extract_text = (
-                constrained_prompts.extract_text_constrained
-            )
-            extract_edges_module.edge = constrained_prompts.extract_edges_constrained
-
-            self.logger.info("Applied constrained prompts to prevent hallucinations")
-        except Exception as exc:  # pylint: disable=broad-exception-caught
-            self.logger.warning("Failed to apply constrained prompts: %s", exc)
-            self.logger.warning(
-                "Continuing with default Graphiti prompts (may cause hallucinations)"
-            )
-
-        return Graphiti(graph_driver=driver)
 
     def _collect_documents(self, base_dir: Path) -> List[Path]:
         """Collects all text document files from the specified directory.
@@ -1227,7 +853,6 @@ class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance
         text = raw_text.replace("\r\n", "\n").replace("\r", "\n")
         text = self._strip_front_matter(text)
 
-        # Split by decisions/resolutions first, then extract annexes as separate sections
         for regex in (self.DECISION_RESOLUTION_HEADING_RE, self.OTHER_HEADING_RE):
             sections = self._split_by_headings(text, regex)
             if sections:
@@ -1239,14 +864,12 @@ class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance
                     if annex_matches:
                         first_annex_pos = annex_matches[0].start()
 
-                        # Decision content (before annex)
                         if first_annex_pos > self.MIN_SECTION_LEN:
                             decision_part = section["body"][:first_annex_pos].strip()
                             final_sections.append(
                                 {"title": section["title"], "body": decision_part}
                             )
 
-                        # Annex sections
                         annex_text = section["body"][first_annex_pos:]
                         annex_subsections = self._split_by_headings(
                             annex_text, self.ANNEX_HEADING_RE
@@ -1349,7 +972,7 @@ class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance
         """
         sections: List[Dict[str, str]] = []
         for idx in range(0, len(text), self.FALLBACK_CHARS):
-            chunk = text[idx : idx + self.FALLBACK_CHARS].strip()
+            chunk = text[idx: idx + self.FALLBACK_CHARS].strip()  # noqa: E203
             if len(chunk) < self.MIN_SECTION_LEN:
                 continue
             sections.append(
@@ -1385,7 +1008,8 @@ class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance
         """Builds episode body text with metadata headers.
 
         Prepends conference, session, year, location, and document reference
-        information to the section body for context.
+        information to the section body for context. Subclasses can add additional
+        headers via _extra_header_lines().
 
         Args:
             section_body: The main text content of the section.
@@ -1405,10 +1029,25 @@ class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance
             header_lines.append(f"Location: {metadata['location']}")
         if metadata.get("fccc_reference"):
             header_lines.append(f"Document: {metadata['fccc_reference']}")
+        header_lines.extend(self._extra_header_lines(metadata))
 
         if not header_lines:
             return section_body
         return "\n".join(header_lines) + "\n\n" + section_body
+
+    def _extra_header_lines(self, metadata: Dict[str, str]) -> List[str]:
+        """Hook for subclasses to add additional header lines to episode body.
+
+        Called by _build_episode_body after the standard headers. Override in
+        subclasses to append database-specific metadata headers.
+
+        Args:
+            metadata: Metadata dictionary with conference information.
+
+        Returns:
+            List of additional header line strings (empty by default).
+        """
+        return []
 
     def _limit_episodes(self, episodes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Limits the number of episodes to process based on MAX_EPISODES configuration.
@@ -1717,15 +1356,14 @@ class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance
         Args:
             graphiti: The Graphiti client instance (not used in this demo).
         """
-        del graphiti  # Not needed for this demo method
+        del graphiti
         self._print_section("REFERENCE TRAVERSAL DEMO", double_space=True)
 
-        # Show some sample references
         sample_count = 0
         for episode_name, refs in list(self.reference_map.items())[:3]:
             self.logger.info("\n--- Episode: %s ---", episode_name[:80])
             self.logger.info("References %d other decisions/articles:", len(refs))
-            for ref in refs[:5]:  # Show first 5 references
+            for ref in refs[:5]:
                 if ref["type"] == "decision":
                     ref_text = f"  → Decision {ref['target']}"
                     if ref.get("paragraphs"):
@@ -1756,19 +1394,13 @@ class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance
         """
         self._print_section("TEMPORAL QUERY DEMO", double_space=True)
 
-        # Build temporal index from decision registry
         decisions_by_year: Dict[str, List[str]] = defaultdict(list)
         for decision_id, episode_name in self.decision_registry.items():
-            # Extract year from metadata if available
             for episode_name_iter, refs in self.reference_map.items():
                 if episode_name_iter == episode_name and refs:
-                    # Get year from first reference's context or episode metadata
                     break
-            # Extract year from decision ID (e.g., "15/CMA.1" -> session 1 -> typically 2018)
-            # Or from episode name which contains year
             if "::" in episode_name:
                 filename_part = episode_name.split("::")[0]
-                # Extract year from filename (e.g., "CMA2018_1.3_Decisions")
                 year_match = re.search(r"(\d{4})", filename_part)
                 if year_match:
                     year = year_match.group(1)
@@ -1783,10 +1415,8 @@ class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance
         for year in sorted_years:
             self.logger.info("%s: %d decisions", year, len(decisions_by_year[year]))
 
-        # Demo: Show decisions from a specific time period
         self._print_section("TEMPORAL RANGE QUERY DEMO")
 
-        # Example: Show decisions from 2020-2022
         start_year = "2020"
         end_year = "2022"
         decisions_in_range = []
@@ -1805,10 +1435,8 @@ class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance
             if len(decisions_in_range) > 10:
                 self.logger.info("  ... and %d more", len(decisions_in_range) - 10)
 
-        # Demo: Timeline evolution query
         self._print_section("TEMPORAL EVOLUTION QUERY")
 
-        # Check if we have decisions across multiple years
         if len(sorted_years) >= 2:
             self.logger.info("\nTimeline: %s to %s", sorted_years[0], sorted_years[-1])
             self.logger.info(
@@ -1821,7 +1449,6 @@ class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance
                 bar_chart = "█" * min(count, 50)
                 self.logger.info("  %s: %s (%d)", year, bar_chart, count)
 
-        # Demo: Query with temporal context
         self._print_section("QUERYING WITH TEMPORAL CONTEXT")
 
         temporal_queries = [
@@ -1835,7 +1462,7 @@ class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance
             ),
         ]
 
-        for query in temporal_queries[:1]:  # Just run one to avoid too much output
+        for query in temporal_queries[:1]:
             self.logger.info("\nQuery: %s", query)
             try:
                 results = await graphiti.search(query)
@@ -1869,10 +1496,8 @@ class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance
         """
         self._print_section("PARAGRAPH-LEVEL ACCESS DEMO", double_space=True)
 
-        # Find episodes with paragraph indices
         episodes_with_paragraphs = []
         for decision_id, episode_name in self.decision_registry.items():
-            # Check if this episode has references with paragraph numbers
             refs = self.reference_map.get(episode_name, [])
             has_para_refs = any(ref.get("paragraphs") for ref in refs)
             if has_para_refs:
@@ -1887,13 +1512,11 @@ class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance
             len(episodes_with_paragraphs)
         )
 
-        # Show a few examples
         self._print_section("EXAMPLE: Decisions Referencing Specific Paragraphs")
 
         for decision_id, episode_name, refs in episodes_with_paragraphs[:3]:
             self.logger.info("\n--- Decision: %s ---", decision_id)
 
-            # Show paragraph references this decision makes
             para_refs = [ref for ref in refs if ref.get("paragraphs")]
             if para_refs:
                 self.logger.info("This decision references specific paragraphs in:")
@@ -1902,10 +1525,8 @@ class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance
                     paras = ref.get("paragraphs", "")
                     self.logger.info("  • %s, paragraph(s) %s", target, paras)
 
-        # Example query demonstration
         self._print_section("EXAMPLE PARAGRAPH-LEVEL QUERY")
 
-        # Pick a decision with paragraph references to demonstrate
         if episodes_with_paragraphs:
             decision_id, episode_name, refs = episodes_with_paragraphs[0]
             para_ref = next((ref for ref in refs if ref.get("paragraphs")), None)
@@ -1917,7 +1538,6 @@ class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance
 
                 self.logger.info("\nQuery: %s", query)
                 try:
-                    # Actually run the query
                     results = await graphiti.search(query)
                     results = (results or [])[:2]
 
@@ -1950,17 +1570,3 @@ class FalkorDBIngestionEnhanced(CodedTool):  # pylint: disable=too-many-instance
             self.logger.info(
                 "Skipping demo searches (no episodes were successfully added)"
             )
-
-
-async def main() -> None:
-    """Standalone entry point for manual execution.
-
-    Creates a FalkorDBIngestionEnhanced instance with default configuration
-    from environment variables and runs the complete ingestion pipeline.
-    """
-    runner = FalkorDBIngestionEnhanced()
-    await runner.run()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
